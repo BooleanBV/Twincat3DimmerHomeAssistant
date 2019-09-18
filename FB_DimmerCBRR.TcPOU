@@ -1,0 +1,431 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <POU Name="FB_DimmerCBRR" Id="{01d91c75-2cf4-4044-82a5-cbdcaef2b2b4}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_DimmerCBRR
+VAR_INPUT
+	bOn			: BOOL;		(*dim on to last value (all on bit)*)
+	bOff		: BOOL;		(*dimm off (all off bit)*)
+	tTimeDimOn : TIME;		(*time to dimm on*)
+	tTimeDomOff: TIME;		(*time to dimm off*)
+	minValue: UINT;			(*minimum dimm value (0-255)*)
+	maxValue: UINT;			(*maximum dimm value (0-255*)
+	bPb			: BOOL;		(*pb: short pulse to dim on or off, long press to dim hold to run.*)
+	nIgnition: UINT; 		(*value where LED ignites*)
+END_VAR
+VAR_OUTPUT
+	nOut: UINT;				(* UINT output (0-512)*)
+	bLight: BOOL;			(*boolean for button pilot light*)
+	nOutDmx: BYTE;			(*byte DMX output*)
+	nOutPercentage: UINT;	(*percentage output (0-100%)*)
+END_VAR
+VAR_IN_OUT
+	nHaValue: UINT;			(*Output will folow this value upon change, 500ms after value is not changed anymore (as Home assistant value)(0-255)*)
+	bHaSwitch: BOOL;		(*Switch boolean from home assistant*)
+END_VAR
+VAR
+	state: INT;
+	rtrigSetDimValue: R_TRIG;
+	tmrDimUp : TON;
+	tmrDimDown: TON;
+	diMFactor: REAL;
+	dimValueToGoTo : UINT;
+	timeNeededToDimUp: TIME;
+	timeNeededToDimDown : TIME ;
+	prevOutputValue: UINT;	(*previous output value*)
+	prevDimValue: UINT;		(*previous selected dim value*)
+	prevManualValue: UINT;	(*prev manual value*)
+	tmrWaitManualValue: TON;
+	stateManualValue: INT;
+	bManualValueChanged : BOOL;
+	lastHtrCmdUp: BOOL;
+	fbShortLongClick : FB_ShortLongClick;
+	rtrigShortClick : R_TRIG;
+	rtrigLongClick : R_TRIG;
+	rtrigOff: R_TRIG;
+	rtrigOn: R_TRIG;
+	memoryValue: UINT;
+	tmrIgnite: TON;					(*tmr to wait to LED to ignite*)
+	rtrigHaSwitch: R_TRIG;			(*Detect rising edge of HA switch*)
+	ftrigHaSwitch	: F_TRIG;			(*Detect falling edge of HA switch*)
+	trmHaDelayFtrig: TON;
+END_VAR	
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[rtrigHaSwitch(CLK:=bHaSwitch , Q=> );
+(*on rising egde, go to HA value if it is not zero, else go to previous value*)
+IF rtrigHaSwitch.Q AND NOT bLight AND state=0 THEN
+	IF memoryValue > 0 THEN
+			dimValueToGoTo := memoryValue;	
+	ELSE
+			dimValueToGoTo := maxValue;
+	END_IF
+		//ignite the LED and continue dimming
+		//feedback to HA
+		nHaValue := dimValueToGoTo;
+		state:=5;
+END_IF
+
+(*On falling edge of HA light switch, dimm light off*)
+ftrigHaSwitch(CLK:= bHaSwitch, Q=> );
+IF ftrigHaSwitch.Q AND bLight AND state = 0THEN
+	dimValueToGoTo := 0;
+	memoryValue:=nOut;
+	//instant feedback to HA
+	nHaValue:=0;
+	bHaSwitch:=FALSE;
+	state:=10;
+END_IF
+
+
+(* All On, only allow when light is off*)
+rtrigOn(CLK:=bOn , Q=> );
+IF rtrigOn.Q AND NOT bLight THEN
+	IF memoryValue > 0 THEN
+			dimValueToGoTo := memoryValue;	
+	ELSE
+			dimValueToGoTo := maxValue;
+	END_IF
+		//ignite the LED and continue dimming
+		state:=5;
+		nHaValue := dimValueToGoTo;
+END_IF
+
+(* All off, only allow when light is on*)
+rtrigOff(CLK:=bOff , Q=> );
+IF rtrigOff.Q AND bLight THEN
+	dimValueToGoTo := 0;
+	bHaSwitch:=FALSE;
+	nHaValue := dimValueToGoTo;
+	prevDimValue := nout;
+	state:=10;
+END_IF
+
+
+(*  SELECT COMMAND WITH ONE PUSHBUTTON		*)
+fbShortLongClick(bSwitch:= bPb, tSwitchTime:=T#500MS , bShortClick=> , bLongClick=> );
+(*short click: toggle light on or off*)
+rtrigShortClick(CLK:= fbShortLongClick.bShortClick, Q=> );
+IF rtrigShortClick.Q THEN
+	(*if light is off, dimm it on*)
+	IF NOT bLight THEN
+		IF memoryValue > 0 THEN
+			dimValueToGoTo := memoryValue;	
+		ELSE
+			dimValueToGoTo := maxValue;
+		END_IF
+		bHaSwitch:=TRUE;
+		nHaValue:=dimValueToGoTo;
+		state:=5;
+	ELSE(*if light is on, dimm it off*)
+		(*store the current value as memory*)
+		memoryValue := nout;
+		dimValueToGoTo := 0;
+		bHaSwitch:=FALSE;
+		state:=10;
+	END_IF
+END_IF
+
+rtrigLongClick(CLK:=fbShortLongClick.bLongClick , Q=> );
+IF rtrigLongClick.Q THEN 
+	(*if output value is almost at max, dim down*)
+	IF nOut >= LREAL_TO_UINT((maxValue * 0.7)) THEN
+		(*dim down*)
+		state:=110;
+	ELSE
+	(*if output value is almost off, dim up*)
+	IF nOut <=  LREAL_TO_UINT(minValue * 1.3) THEN
+		(*dim up*)
+		state:=100;
+	ELSE
+		(*just dim up*)
+		state:=100;
+	END_IF
+	END_IF
+END_IF
+
+
+(* DETECT CHANGE OF MANUAL VALUE		*)
+IF nHaValue <> prevManualValue AND state=0 AND bHaSwitch  THEN
+	prevManualValue := nHaValue;
+	tmrWaitManualValue(IN:=0 , PT:=T#500MS , Q=> , ET=> );
+	
+	stateManualValue := 10;
+	
+END_IF
+
+
+(*detect stopping of change of manual value, then execute dim sequence*)
+CASE stateManualValue OF
+	0:
+	;
+			tmrWaitManualValue(IN:=0 , PT:=T#100MS , Q=> , ET=> );
+	10:
+		(*Start a timer, when there is no change for 500ms, execute dimming process*)
+		(*Wait until the manual value has stopped changing for 500ms*)
+		tmrWaitManualValue(IN:=1 , PT:=T#500MS , Q=> , ET=> );
+		
+		IF tmrWaitManualValue.Q THEN
+			tmrWaitManualValue(IN:=0 , PT:=T#100MS , Q=> , ET=> );
+			dimValueToGoTo := nHaValue;
+			(*execute dimming*)
+			stateManualValue:=0;
+			//if light is off, first ignite LED 
+			IF state=0 THEN
+			IF NOT bLight THEN
+			state:=5;
+			ELSE
+			//if light is on, then just continue dimming
+			state:=10;
+			END_IF;
+			END_IF;
+		END_IF
+		
+		IF state=0 THEN
+		IF nHaValue <> prevManualValue THEN
+			prevManualValue := nHaValue;
+			stateManualValue := 0;
+		END_IF
+		END_IF
+		
+		
+END_CASE
+
+
+
+CASE state OF
+	0:
+	;
+	tmrDimDown(IN:= 0, PT:= , Q=> , ET=> );
+	tmrDimUp(IN:= 0, PT:= , Q=> , ET=> );
+	tmrIgnite(IN:=0, PT:=T#300MS , Q=> , ET=> );
+	
+	5:
+		(*ignite the LED*)
+		nOut:= nIgnition;
+		tmrIgnite(IN:= 1, PT:=T#300MS , Q=> , ET=> );
+		IF tmrIgnite.Q THEN
+			tmrIgnite(IN:=0, PT:=T#300MS , Q=> , ET=> );
+			state:=10;
+		END_IF
+		bHaSwitch:=TRUE;
+	
+		//realtime feedback to HA during dimming
+		//nHaValue := nOut;
+	
+	10:
+		(*Go to selected dim value		*)
+		(*Dim up:*)
+		IF dimValueToGoTo > nOut THEN
+			(*calculate time to achieve dim curve*)
+			timeNeededToDimUp := LREAL_TO_TIME( (UINT_TO_LREAL (dimValueToGoTo - nOut)/(UINT_TO_LREAL(maxValue-minValue))) * TIME_TO_LREAL(tTimeDimOn));
+			prevOutputValue := nout;
+			diMFactor := (UINT_TO_LREAL (dimValueToGoTo - nOut)) / TIME_TO_LREAL(timeNeededToDimUp);
+			state:=20;
+		END_IF
+		(*dim down*)
+		IF dimValueToGoTo < nOut THEN
+			(*calculate time to achieve dim curve*)
+			timeNeededToDimDown:= LREAL_TO_TIME( (UINT_TO_LREAL (nout - dimValueToGoTo)/(UINT_TO_LREAL(maxValue-minValue))) * TIME_TO_LREAL(tTimeDimOn));
+			prevOutputValue := nout;
+			diMFactor := (UINT_TO_LREAL(nout - dimValueToGoTo)) / TIME_TO_LREAL(timeNeededToDimDown);
+			state:=30;
+		END_IF
+		
+		(*do nothing*)
+		IF dimValueToGoTo = nOut THEN
+			state:=0;
+		END_IF
+		
+		
+	20:(*dim up to selected dim value*)
+	tmrDimUp(IN:=1, PT:=timeNeededToDimUp , Q=> , ET=> );
+	
+	IF NOT tmrDimUp.Q THEN
+		nout := prevOutputValue + LREAL_TO_UINT(diMFactor * TIME_TO_LREAL(tmrDimUp.ET));
+		IF nOut >= dimValueToGoTo THEN
+			nout := dimValueToGoTo;
+		END_IF
+	ELSE
+		tmrDimUp(IN:=0, PT:=tTimeDimOn , Q=> , ET=> );
+		nout := dimValueToGoTo;
+		state:=0;
+	END_IF;
+	
+	
+	
+	30:(*dimm down to selected dim value*)
+	tmrDimDown(IN:=1 , PT:= timeNeededToDimDown, Q=> , ET=> );
+	
+	IF NOT tmrDimDown.Q THEN
+		nout := prevOutputValue - LREAL_TO_UINT(diMFactor * TIME_TO_LREAL(tmrDimDown.ET));
+		IF nOut <=dimValueToGoTo THEN
+			nout := dimValueToGoTo;
+		END_IF
+	ELSE
+		tmrDimDown(IN:=0 , PT:= tTimeDomOff, Q=> , ET=> );
+		nout := dimValueToGoTo;
+		state:=0;
+	END_IF;
+	
+
+		
+	
+100:
+	(*dim up to max value while holding the psubutton*)
+	dimValueToGoTo := maxValue;
+	timeNeededToDimUp := LREAL_TO_TIME( (UINT_TO_LREAL (dimValueToGoTo - nOut)/(UINT_TO_LREAL(maxValue-minValue))) * TIME_TO_LREAL(tTimeDimOn));
+	prevOutputValue := nout;
+	IF timeNeededToDimUp <= T#0S THEN
+		timeNeededToDimUp:=T#1MS;
+	END_IF
+	diMFactor := (UINT_TO_LREAL (dimValueToGoTo - nOut)) / TIME_TO_LREAL(timeNeededToDimUp);
+	state:=101;
+	
+101:
+	(*dim up to max value while holding the psubutton*)
+	IF bPb THEN
+		tmrDimUp(IN:=1, PT:=timeNeededToDimUp , Q=> , ET=> );
+		IF NOT tmrDimUp.Q THEN
+			nout := prevOutputValue + LREAL_TO_UINT(diMFactor * TIME_TO_LREAL(tmrDimUp.ET));
+			IF nOut >= dimValueToGoTo THEN
+				nout := dimValueToGoTo;
+				(*state:=0;*)
+			END_IF
+		ELSE
+			tmrDimUp(IN:=0, PT:=tTimeDimOn , Q=> , ET=> );
+			nout := dimValueToGoTo;
+			state:=0;
+		END_IF;
+	ELSE
+		tmrDimUp(IN:=0, PT:=timeNeededToDimUp , Q=> , ET=> );
+		state:=0;
+	END_IF;
+	
+//realtime feedback to HA during dimming
+		nHaValue := nOut;
+	
+	
+110:
+	(*dim down to min value while holding the psubutton*)
+	dimValueToGoTo := minValue;
+	timeNeededToDimDown := LREAL_TO_TIME( (UINT_TO_LREAL (nout - dimValueToGoTo)/(UINT_TO_LREAL(maxValue-minValue))) * TIME_TO_LREAL(tTimeDomOff));
+	prevOutputValue := nout;
+	IF timeNeededToDimDown <= T#0S THEN
+		timeNeededToDimDown := T#1mS;
+	END_IF
+	diMFactor := (UINT_TO_LREAL (nout-dimValueToGoTo)) / TIME_TO_LREAL(timeNeededToDimDown);
+	state:=111;
+	
+	
+	
+111:
+(*dim down to min value while holding the psubutton*)
+	IF bPb THEN
+	tmrDimDown(IN:=1 , PT:= timeNeededToDimDown, Q=> , ET=> );
+	
+		IF NOT tmrDimDown.Q THEN
+			nout := prevOutputValue - LREAL_TO_UINT(diMFactor * TIME_TO_LREAL(tmrDimDown.ET));
+			IF nOut <=dimValueToGoTo THEN
+				nout := dimValueToGoTo;
+				(*state:=0;*)
+			END_IF
+		ELSE
+			tmrDimDown(IN:=0 , PT:= tTimeDomOff, Q=> , ET=> );
+			nout := dimValueToGoTo;
+			state:=0;
+		END_IF;
+	ELSE
+		tmrDimDown(IN:=0 , PT:= timeNeededToDimDown, Q=> , ET=> );
+		state:=0;
+	END_IF
+	
+	//realtime feedback to HA during dimming
+		nHaValue := nOut;
+
+		
+END_CASE
+
+(*set pilot light*)
+IF nOut > 0 THEN
+	bLight := TRUE;
+	
+END_IF
+	
+IF nOut = 0 THEN
+	bLight := FALSE;
+
+END_IF
+
+
+(*set DMX output*)
+IF nOut >= 0 AND nOut <=255 THEN
+	nOutDmx := UINT_TO_BYTE(nOut);
+ELSE
+	nOutDmx := 0;
+END_IF
+
+(*set percentage ouput*)
+nOutPercentage := REAL_TO_INT((nOut / 255.0)*100.0);]]></ST>
+    </Implementation>
+    <LineIds Name="FB_DimmerCBRR">
+      <LineId Id="1632" Count="0" />
+      <LineId Id="1637" Count="0" />
+      <LineId Id="1673" Count="0" />
+      <LineId Id="1679" Count="5" />
+      <LineId Id="1691" Count="0" />
+      <LineId Id="1687" Count="0" />
+      <LineId Id="1678" Count="0" />
+      <LineId Id="1677" Count="0" />
+      <LineId Id="1650" Count="1" />
+      <LineId Id="1628" Count="0" />
+      <LineId Id="1652" Count="1" />
+      <LineId Id="1685" Count="0" />
+      <LineId Id="1690" Count="0" />
+      <LineId Id="1688" Count="1" />
+      <LineId Id="1655" Count="0" />
+      <LineId Id="1654" Count="0" />
+      <LineId Id="1629" Count="1" />
+      <LineId Id="1332" Count="9" />
+      <LineId Id="1703" Count="0" />
+      <LineId Id="1342" Count="2" />
+      <LineId Id="1346" Count="2" />
+      <LineId Id="1698" Count="0" />
+      <LineId Id="1705" Count="0" />
+      <LineId Id="1708" Count="0" />
+      <LineId Id="1349" Count="1" />
+      <LineId Id="1379" Count="13" />
+      <LineId Id="1706" Count="1" />
+      <LineId Id="1393" Count="4" />
+      <LineId Id="1700" Count="0" />
+      <LineId Id="1398" Count="48" />
+      <LineId Id="1669" Count="0" />
+      <LineId Id="1447" Count="5" />
+      <LineId Id="1670" Count="0" />
+      <LineId Id="1453" Count="1" />
+      <LineId Id="1671" Count="0" />
+      <LineId Id="1455" Count="3" />
+      <LineId Id="1672" Count="0" />
+      <LineId Id="1459" Count="20" />
+      <LineId Id="1699" Count="0" />
+      <LineId Id="1480" Count="0" />
+      <LineId Id="1656" Count="1" />
+      <LineId Id="1481" Count="38" />
+      <LineId Id="1658" Count="1" />
+      <LineId Id="1520" Count="13" />
+      <LineId Id="1661" Count="0" />
+      <LineId Id="1663" Count="0" />
+      <LineId Id="1534" Count="32" />
+      <LineId Id="1664" Count="0" />
+      <LineId Id="1567" Count="13" />
+      <LineId Id="1665" Count="1" />
+      <LineId Id="1581" Count="21" />
+      <LineId Id="1668" Count="0" />
+      <LineId Id="1603" Count="6" />
+      <LineId Id="1696" Count="0" />
+      <LineId Id="1610" Count="3" />
+      <LineId Id="1697" Count="0" />
+      <LineId Id="1614" Count="10" />
+      <LineId Id="549" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>
