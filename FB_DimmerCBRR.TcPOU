@@ -364,6 +364,16 @@ ELSE
 	nOutDmx := 0;
 END_IF
 
+(*Monitor range of min and max dim levels*)
+IF minValue > maxValue OR minValue<0 THEN
+	minValue:=0;
+END_IF
+
+IF maxValue < minValue OR maxValue > 255 THEN
+	maxValue := 255;
+END_IF
+
+
 (*set percentage ouput*)
 nOutPercentage := REAL_TO_INT((nOut / 255.0)*100.0);]]></ST>
     </Implementation>
